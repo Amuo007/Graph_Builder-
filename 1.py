@@ -1,88 +1,126 @@
 #!/usr/bin/env python3
-import time
-import os
+import time, os, json, subprocess
 
-def read_file(path, default="N/A"):
+def sh(cmd):
     try:
-        with open(path) as f:
-            return f.read().strip()
-    except:
-        return default
+        return subprocess.check_output(cmd, shell=True, text=True).strip()
+    except Exception:
+        return ""
 
-def get_ram():
+def get_ram_mb():
     try:
+        mem = {}
         with open("/proc/meminfo") as f:
-            lines = {l.split(":")[0]: int(l.split()[1]) for l in f if ":" in l}
-        total = lines.get("MemTotal", 0)
-        available = lines.get("MemAvailable", 0)
-        used = total - available
-        return used // 1024, total // 1024  # MB
-    except:
+            for line in f:
+                if ":" in line:
+                    k, rest = line.split(":", 1)
+                    v = rest.strip().split()
+                    if v and v[0].isdigit():
+                        mem[k] = int(v[0])  # kB
+        total = mem.get("MemTotal", 0)
+        avail = mem.get("MemAvailable", 0)
+        used = max(0, total - avail)
+        return used // 1024, total // 1024
+    except Exception:
         return 0, 0
 
-def get_cpu():
+# CPU% without doing an extra sleep inside (keeps previous sample)
+_prev_idle = None
+_prev_total = None
+def get_cpu_percent():
+    global _prev_idle, _prev_total
     try:
-        def read_stat():
-            with open("/proc/stat") as f:
-                parts = f.readline().split()
-            idle = int(parts[4])
-            total = sum(int(x) for x in parts[1:])
-            return idle, total
-
-        idle1, total1 = read_stat()
-        time.sleep(0.5)
-        idle2, total2 = read_stat()
-        usage = 100 * (1 - (idle2 - idle1) / (total2 - total1))
-        return round(usage, 1)
-    except:
+        parts = open("/proc/stat").readline().split()[1:]
+        nums = list(map(int, parts))
+        idle = nums[3] + nums[4]  # idle + iowait
+        total = sum(nums)
+        if _prev_idle is None:
+            _prev_idle, _prev_total = idle, total
+            return "N/A"  # first sample has no delta yet
+        didle = idle - _prev_idle
+        dtotal = total - _prev_total
+        _prev_idle, _prev_total = idle, total
+        if dtotal <= 0:
+            return "N/A"
+        return round(100.0 * (1.0 - (didle / dtotal)), 1)
+    except Exception:
         return "N/A"
 
 def get_battery():
-    # Common sysfs paths — may vary by device
-    bases = [
-        "/sys/class/power_supply/battery",
-        "/sys/class/power_supply/BAT0",
-        "/sys/class/power_supply/BAT1",
-    ]
-    
-    base = next((b for b in bases if os.path.exists(b)), None)
-    if not base:
-        return {"voltage": "N/A", "temp": "N/A", "status": "N/A", "capacity": "N/A"}
+    # 1) Termux:API (best)
+    out = sh("termux-battery-status")
+    if out.startswith("{"):
+        try:
+            j = json.loads(out)
+            # temperature is °C in termux-battery-status
+            return {
+                "capacity": str(j.get("percentage", "N/A")),
+                "status": str(j.get("status", "N/A")),
+                "voltage": str(j.get("voltage", "N/A")),
+                "temp_c": str(j.get("temperature", "N/A")),
+                "source": "termux-battery-status",
+            }
+        except Exception:
+            pass
 
-    voltage_raw = read_file(f"{base}/voltage_now")
-    temp_raw    = read_file(f"{base}/temp")
-    status      = read_file(f"{base}/status")
-    capacity    = read_file(f"{base}/capacity")
+    # 2) dumpsys battery (usually works even without Termux:API app)
+    ds = sh("dumpsys battery")
+    if ds:
+        # very simple parse
+        def grab(key):
+            for line in ds.splitlines():
+                line = line.strip()
+                if line.lower().startswith(key.lower() + ":"):
+                    return line.split(":",1)[1].strip()
+            return "N/A"
+        temp = grab("temperature")  # often in tenths of °C
+        temp_c = "N/A"
+        if temp.isdigit():
+            temp_c = f"{int(temp)/10:.1f}"
+        return {
+            "capacity": grab("level"),
+            "status": grab("status"),
+            "voltage": grab("voltage"),
+            "temp_c": temp_c,
+            "source": "dumpsys battery",
+        }
 
-    voltage = f"{int(voltage_raw) / 1_000_000:.3f}V" if voltage_raw.isdigit() else "N/A"
-    temp    = f"{int(temp_raw) / 10:.1f}°C"           if temp_raw.isdigit()    else "N/A"
+    # 3) sysfs fallback (some devices allow it)
+    for base in ("/sys/class/power_supply/battery", "/sys/class/power_supply/BAT0", "/sys/class/power_supply/BAT1"):
+        if os.path.exists(base):
+            def rf(p):
+                try: return open(p).read().strip()
+                except: return ""
+            cap = rf(f"{base}/capacity") or "N/A"
+            stat = rf(f"{base}/status") or "N/A"
+            vraw = rf(f"{base}/voltage_now")
+            traw = rf(f"{base}/temp")
+            volt = f"{int(vraw)/1_000_000:.3f}" if vraw.isdigit() else "N/A"
+            temp_c = f"{int(traw)/10:.1f}" if traw.isdigit() else "N/A"
+            return {"capacity": cap, "status": stat, "voltage": volt, "temp_c": temp_c, "source": base}
 
-    return {"voltage": voltage, "temp": temp, "status": status, "capacity": capacity}
+    return {"capacity":"N/A","status":"N/A","voltage":"N/A","temp_c":"N/A","source":"none"}
 
-prev_ram_used = None
-
+prev_used = None
 print("=== IIAB Android Monitor (Ctrl+C to stop) ===\n")
 
 while True:
-    ram_used, ram_total = get_ram()
-    cpu = get_cpu()
+    used, total = get_ram_mb()
+    cpu = get_cpu_percent()
     bat = get_battery()
 
-    # Track RAM delta
-    ram_delta = ""
-    if prev_ram_used is not None:
-        diff = ram_used - prev_ram_used
-        ram_delta = f"  ({'+' if diff >= 0 else ''}{diff} MB)"
-    prev_ram_used = ram_used
+    delta = ""
+    if prev_used is not None:
+        d = used - prev_used
+        delta = f" ({'+' if d >= 0 else ''}{d} MB)"
+    prev_used = used
 
-    # Battery trend
-    status_icon = {"Charging": "⬆", "Discharging": "⬇", "Full": "✓"}.get(bat["status"], "?")
+    icon = {"Charging":"⬆","Discharging":"⬇","Full":"✓"}.get(bat["status"], "?")
 
     print(f"[{time.strftime('%H:%M:%S')}]")
-    print(f"  RAM  : {ram_used} / {ram_total} MB{ram_delta}")
+    print(f"  RAM  : {used} / {total} MB{delta}")
     print(f"  CPU  : {cpu}%")
-    print(f"  Bat  : {bat['capacity']}% | {bat['voltage']} {status_icon} {bat['status']}")
-    print(f"  Temp : {bat['temp']}")
+    print(f"  Bat  : {bat['capacity']}% | {bat['voltage']} {icon} {bat['status']}  [{bat['source']}]")
+    print(f"  Temp : {bat['temp_c']} °C")
     print("-" * 35)
-
     time.sleep(3)
