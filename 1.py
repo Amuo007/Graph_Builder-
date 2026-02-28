@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import subprocess, time
-from datetime import datetime
 
 INTERVAL = 3
 
@@ -10,57 +9,90 @@ def run(cmd):
     except:
         return ""
 
+# -------- RAM --------
 def ram():
-    total = avail = 0
+    total = free = 0
     with open("/proc/meminfo") as f:
         for line in f:
-            if "MemTotal" in line:
+            if line.startswith("MemTotal"):
                 total = int(line.split()[1])
-            if "MemAvailable" in line:
-                avail = int(line.split()[1])
-    used = (total - avail) // 1024
-    total = total // 1024
-    return used, total
+            elif line.startswith("MemAvailable"):
+                free = int(line.split()[1])
+    return total // 1024, free // 1024
 
+
+# -------- CPU (Android safe using top) --------
+def cpu_percent():
+    out = run("top -bn1 | grep -m1 -E 'CPU|Cpu|cpu'")
+    if not out:
+        return "N/A"
+
+    try:
+        # works for most Android formats
+        parts = out.replace(",", " ").split()
+        for i, p in enumerate(parts):
+            if "%" in p:
+                return p
+    except:
+        pass
+
+    return "N/A"
+
+
+# -------- SERVICES --------
 def services():
-    out = run("ps -eo comm,%cpu,rss")
-    data = {
-        "kolibri": (0,0),
-        "nginx": (0,0),
-        "mariadbd": (0,0)
-    }
+    out = run("ps -eo comm=,%cpu= --sort=-%cpu")
+    data = {"kolibri": 0.0, "nginx": 0.0, "mariadbd": 0.0}
 
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) < 3:
+        if len(parts) < 2:
             continue
 
         name = parts[0]
-        cpu = float(parts[1])
-        mem = int(parts[2]) // 1024
+        try:
+            cpu = float(parts[1])
+        except:
+            continue
 
         for k in data:
             if k in name:
-                data[k] = (cpu, mem)
+                data[k] = cpu
 
     return data
 
+
+# -------- BATTERY + TEMP --------
+def battery():
+    out = run("termux-battery-status")
+    if not out:
+        return "N/A", "N/A", "N/A"
+
+    try:
+        import json
+        j = json.loads(out)
+        return j["percentage"], j["temperature"], j["status"]
+    except:
+        return "N/A", "N/A", "N/A"
+
+
+# -------- MAIN LOOP --------
 print("=== IIAB SIMPLE MONITOR (Ctrl+C to stop) ===")
 
 try:
     while True:
-        t = datetime.now().strftime("%H:%M:%S")
+        total, free = ram()
+        used = total - free
 
-        used, total = ram()
+        cpu = cpu_percent()
+        bat, temp, status = battery()
         s = services()
 
-        print("\n[", t, "]", sep="")
-        print(f"RAM: {used} / {total} MB")
-
-        for k in s:
-            cpu, mem = s[k]
-            print(f"{k:8} CPU: {cpu:5.1f}%   RAM: {mem} MB")
-
+        print(f"\nRAM  : {used} / {total} MB")
+        print(f"CPU  : {cpu}")
+        print(f"Bat  : {bat}% | {status}")
+        print(f"Temp : {temp} °C")
+        print("Srv  :", s)
         print("-" * 40)
 
         time.sleep(INTERVAL)
