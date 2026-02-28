@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
-termux_sys_stats.py
-Same output as before, but:
-- Appends output to a log file (TXT)
-- Runs continuously until you exit (Ctrl+C)
-- Adds a timestamp header for each snapshot
+termux_cpu_snapshot.py
+One-time CPU snapshot (no loop). Designed for Termux (no root).
+Grabs:
+- /proc/cpuinfo summary + raw
+- CPU online/present/possible
+- per-core cpufreq (cur/min/max), governor, available freqs/governors
+- per-core topology (package/core ids) when available
+- android getprop SoC/ABI info
+- some scheduler/cpuset hints (if accessible)
+- optional: top cpu processes (may be restricted)
 
 Run:
-  python termux_sys_stats.py
-Stop:
-  Ctrl + C
+  python termux_cpu_snapshot.py
 """
 
 import os
-import platform
-import shutil
-import subprocess
 import json
-import time
+import platform
+import subprocess
 from datetime import datetime
 
-
-LOG_FILE = "termux_sys_stats_log.txt"
-INTERVAL_SECONDS = 5  # change to 1, 2, 10, etc.
-
-
 def run(cmd: str) -> str:
-    """Run shell command and return stdout (or empty string)."""
     try:
         p = subprocess.run(cmd, shell=True, text=True, capture_output=True)
-        return (p.stdout or "").strip()
+        out = (p.stdout or "").strip()
+        return out
     except Exception:
         return ""
-
 
 def read_file(path: str) -> str:
     try:
@@ -41,109 +36,74 @@ def read_file(path: str) -> str:
     except Exception:
         return ""
 
+def exists(path: str) -> bool:
+    try:
+        return os.path.exists(path)
+    except Exception:
+        return False
 
-def parse_meminfo() -> dict:
-    data = {}
-    txt = read_file("/proc/meminfo")
-    for line in txt.splitlines():
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        v = v.strip().split()
-        if v and v[0].isdigit():
-            data[k] = int(v[0])  # kB
-    return data
-
-
-def kb_to_gb(kb: int) -> float:
-    return kb / (1024 * 1024)
-
-
-def fmt_gb(kb: int) -> str:
-    return f"{kb_to_gb(kb):.2f} GB"
-
-
-def get_cpu_freqs() -> list:
-    freqs = []
-    cpu_base = "/sys/devices/system/cpu"
-    if not os.path.isdir(cpu_base):
-        return freqs
-
-    for name in sorted(os.listdir(cpu_base)):
-        if not name.startswith("cpu") or not name[3:].isdigit():
-            continue
-        cur = read_file(os.path.join(cpu_base, name, "cpufreq", "scaling_cur_freq"))
-        if cur.isdigit():
-            mhz = int(cur) / 1000.0  # kHz -> MHz
-            freqs.append((name, mhz))
-    return freqs
-
-
-def parse_thermal_zones() -> list:
-    """
-    Returns list of (zone_name, temp_c, raw_path).
-    temp is commonly in millidegree C. We normalize to °C.
-    """
-    zones = []
-    base = "/sys/class/thermal"
-    if not os.path.isdir(base):
-        return zones
-
-    for z in sorted(os.listdir(base)):
-        if not z.startswith("thermal_zone"):
-            continue
-        zpath = os.path.join(base, z)
-        t_type = read_file(os.path.join(zpath, "type")) or z
-        t_raw = read_file(os.path.join(zpath, "temp"))
-        if not t_raw:
-            continue
-
-        try:
-            val = float(t_raw)
-            temp_c = val / 1000.0 if val > 1000 else val
-            zones.append((t_type.strip(), temp_c, os.path.join(zpath, "temp")))
-        except Exception:
-            continue
-
-    return zones
-
-
-def pick_interesting_temps(zones: list) -> list:
-    if not zones:
+def listdir_safe(path: str):
+    try:
+        return sorted(os.listdir(path))
+    except Exception:
         return []
 
-    keywords = [
-        "cpu", "soc", "ap", "big", "little", "cluster", "gpu",
-        "tsens", "qcom", "pmic", "skin", "battery"
+def int_or_none(s: str):
+    s = (s or "").strip()
+    if s.isdigit():
+        return int(s)
+    try:
+        # sometimes contains newline or spaces
+        return int(float(s))
+    except Exception:
+        return None
+
+def khz_to_mhz(khz: int) -> float:
+    return khz / 1000.0
+
+def parse_cpuinfo(raw: str):
+    """
+    Parses /proc/cpuinfo into:
+    - per_cpu: list of dict blocks
+    - common: dict of most common keys (Hardware/model/Features/etc.)
+    """
+    if not raw:
+        return [], {}
+
+    blocks = []
+    cur = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            if cur:
+                blocks.append(cur)
+                cur = {}
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            cur[k.strip()] = v.strip()
+    if cur:
+        blocks.append(cur)
+
+    common_keys = [
+        "Hardware", "model name", "Processor", "CPU implementer",
+        "CPU part", "CPU revision", "Features", "BogoMIPS", "Serial"
     ]
+    common = {}
+    for k in common_keys:
+        # find first occurrence across blocks
+        for b in blocks:
+            if k in b:
+                common[k] = b[k]
+                break
 
-    def score(name: str) -> int:
-        n = name.lower()
-        return sum(1 for k in keywords if k in n)
+    # also count processors
+    common["cpu_blocks"] = len(blocks)
+    return blocks, common
 
-    zones_sorted = sorted(zones, key=lambda x: (score(x[0]), x[1]), reverse=True)
-    preferred = [z for z in zones_sorted if score(z[0]) > 0]
-    return preferred[:8] if preferred else zones_sorted[:8]
-
-
-def build_report() -> str:
-    lines = []
-    lines.append("=" * 70)
-    lines.append("TERMUX / ANDROID SYSTEM STATS")
-    lines.append("Time: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    lines.append("=" * 70)
-
-    # OS / arch
-    lines.append("\n[OS]")
-    lines.append(f"Kernel: {platform.release()}")
-    lines.append(f"Machine (uname -m): {platform.machine()}")
-    lines.append(f"Platform: {platform.platform()}")
-
-    # Android props
-    lines.append("\n[ANDROID PROPERTIES]")
+def get_android_props():
     props = [
-        "ro.product.model",
         "ro.product.manufacturer",
+        "ro.product.model",
         "ro.build.version.release",
         "ro.build.version.sdk",
         "ro.product.cpu.abi",
@@ -152,168 +112,208 @@ def build_report() -> str:
         "ro.soc.model",
         "ro.hardware",
         "ro.boot.hardware",
+        "ro.board.platform",
     ]
-    any_prop = False
+    out = {}
     for p in props:
         v = run(f"getprop {p}")
         if v:
-            any_prop = True
-            lines.append(f"{p}: {v}")
-    if not any_prop:
-        lines.append("(no getprop output — common inside proot-distro containers)")
+            out[p] = v
+    return out
 
-    # CPU info
-    lines.append("\n[CPU]")
-    cpuinfo = read_file("/proc/cpuinfo")
-    if cpuinfo:
-        interesting = []
-        keys = ("Hardware", "model name", "Processor", "CPU implementer", "CPU part", "Features")
-        for line in cpuinfo.splitlines():
-            if any(line.startswith(k) for k in keys):
-                interesting.append(line)
-        if interesting:
-            lines.extend(interesting[:20])
-        else:
-            lines.append("(cpuinfo present but no common summary keys found)")
-    else:
-        lines.append("/proc/cpuinfo not accessible in this environment (common in some containers).")
+def cpu_paths():
+    base = "/sys/devices/system/cpu"
+    cpus = []
+    for name in listdir_safe(base):
+        if name.startswith("cpu") and name[3:].isdigit():
+            cpus.append(name)
+    return base, cpus
 
-    # CPU online cores
-    online = read_file("/sys/devices/system/cpu/online")
-    present = read_file("/sys/devices/system/cpu/present")
-    if present or online:
-        lines.append(f"CPU present: {present or '(unknown)'}")
-        lines.append(f"CPU online : {online or '(unknown)'}")
+def read_cpufreq(cpu_base: str, cpu: str):
+    # Many devices restrict parts of this; read what we can.
+    d = {"cpu": cpu}
 
-    # CPU frequencies
-    freqs = get_cpu_freqs()
-    if freqs:
-        lines.append("Current CPU freqs:")
-        for cpu, mhz in freqs:
-            lines.append(f"  {cpu}: {mhz:.0f} MHz")
-    else:
-        lines.append("CPU freq: not available (device may restrict cpufreq info).")
+    cpufreq = os.path.join(cpu_base, cpu, "cpufreq")
+    if not exists(cpufreq):
+        d["cpufreq_available"] = False
+        return d
+    d["cpufreq_available"] = True
 
-    # Temperatures
-    lines.append("\n[TEMPERATURES]")
-    zones = parse_thermal_zones()
-    if zones:
-        chosen = pick_interesting_temps(zones)
-        for name, temp_c, path in chosen:
-            lines.append(f"{name}: {temp_c:.1f} °C  ({path})")
-        max_zone = max(zones, key=lambda x: x[1])
-        lines.append(f"Max thermal zone: {max_zone[0]} = {max_zone[1]:.1f} °C")
-    else:
-        lines.append("No thermal zones readable (Samsung/Android may restrict /sys/class/thermal).")
-        lines.append("Fallback: use battery temp via termux-battery-status (below).")
+    cur = int_or_none(read_file(os.path.join(cpufreq, "scaling_cur_freq")))
+    mi  = int_or_none(read_file(os.path.join(cpufreq, "scaling_min_freq")))
+    ma  = int_or_none(read_file(os.path.join(cpufreq, "scaling_max_freq")))
+    gov = read_file(os.path.join(cpufreq, "scaling_governor"))
 
-    # Load average + uptime
-    lines.append("\n[LOAD / UPTIME]")
-    la = read_file("/proc/loadavg")
-    lines.append("loadavg: " + (la if la else "not available"))
-    up = read_file("/proc/uptime")
-    if up:
-        try:
-            sec = float(up.split()[0])
-            lines.append(f"uptime: {sec/3600:.2f} hours")
-        except Exception:
-            lines.append("uptime(raw): " + up)
-    else:
-        lines.append("uptime: not available")
+    d["scaling_governor"] = gov or None
+    d["scaling_cur_freq_khz"] = cur
+    d["scaling_min_freq_khz"] = mi
+    d["scaling_max_freq_khz"] = ma
+    if cur is not None:
+        d["scaling_cur_freq_mhz"] = round(khz_to_mhz(cur), 1)
+    if mi is not None:
+        d["scaling_min_freq_mhz"] = round(khz_to_mhz(mi), 1)
+    if ma is not None:
+        d["scaling_max_freq_mhz"] = round(khz_to_mhz(ma), 1)
 
-    # Memory / Swap
-    lines.append("\n[MEMORY]")
-    mi = parse_meminfo()
-    if mi:
-        total = mi.get("MemTotal", 0)
-        free = mi.get("MemFree", 0)
-        avail = mi.get("MemAvailable", 0)
-        swap_total = mi.get("SwapTotal", 0)
-        swap_free = mi.get("SwapFree", 0)
-        lines.append("MemTotal     : " + fmt_gb(total))
-        lines.append("MemFree      : " + fmt_gb(free))
-        if avail:
-            lines.append("MemAvailable : " + fmt_gb(avail))
-        if swap_total:
-            used = max(0, swap_total - swap_free)
-            lines.append("SwapTotal    : " + fmt_gb(swap_total))
-            lines.append("SwapUsed     : " + fmt_gb(used))
-            lines.append("SwapFree     : " + fmt_gb(swap_free))
-    else:
-        lines.append("/proc/meminfo not accessible")
+    # Optional extras
+    d["cpuinfo_cur_freq_khz"] = int_or_none(read_file(os.path.join(cpufreq, "cpuinfo_cur_freq")))
+    d["cpuinfo_min_freq_khz"] = int_or_none(read_file(os.path.join(cpufreq, "cpuinfo_min_freq")))
+    d["cpuinfo_max_freq_khz"] = int_or_none(read_file(os.path.join(cpufreq, "cpuinfo_max_freq")))
 
-    # Storage
-    lines.append("\n[STORAGE]")
-    paths = [
-        ("Termux home", os.path.expanduser("~")),
-        ("Internal shared", "/storage/emulated/0"),
-    ]
-    for label, path in paths:
-        if os.path.exists(path):
-            try:
-                du = shutil.disk_usage(path)
-                lines.append(f"{label} ({path})")
-                lines.append(f"  Total: {du.total/1e9:.1f} GB  Used: {du.used/1e9:.1f} GB  Free: {du.free/1e9:.1f} GB")
-            except Exception:
-                lines.append(f"{label}: cannot read disk usage")
-        else:
-            lines.append(f"{label}: {path} not found (permission needed? try `termux-setup-storage`).")
+    d["available_frequencies_khz"] = read_file(os.path.join(cpufreq, "scaling_available_frequencies")) or None
+    d["available_governors"] = read_file(os.path.join(cpufreq, "scaling_available_governors")) or None
 
-    # Battery (optional)
-    lines.append("\n[BATTERY] (optional)")
-    batt = run("termux-battery-status")
-    if batt:
-        try:
-            jb = json.loads(batt)
-            for k in ["percentage", "status", "plugged", "health", "temperature", "current", "voltage"]:
-                if k in jb:
-                    lines.append(f"{k}: {jb[k]}")
-        except Exception:
-            lines.append(batt)
-    else:
-        lines.append("termux-battery-status not available.")
-        lines.append("Fix: install Termux:API app (from F-Droid) + run `pkg install termux-api`.")
+    # Some kernels expose "related_cpus"
+    d["related_cpus"] = read_file(os.path.join(cpufreq, "related_cpus")) or None
 
-    # Top processes
-    lines.append("\n[TOP PROCESSES]")
-    ps_cmds = [
+    return d
+
+def read_topology(cpu_base: str, cpu: str):
+    topo = os.path.join(cpu_base, cpu, "topology")
+    d = {"cpu": cpu}
+    if not exists(topo):
+        d["topology_available"] = False
+        return d
+    d["topology_available"] = True
+
+    # Common topology files (may be missing)
+    d["physical_package_id"] = int_or_none(read_file(os.path.join(topo, "physical_package_id")))
+    d["core_id"] = int_or_none(read_file(os.path.join(topo, "core_id")))
+    d["cluster_id"] = int_or_none(read_file(os.path.join(topo, "cluster_id")))  # rare
+    d["thread_siblings_list"] = read_file(os.path.join(topo, "thread_siblings_list")) or None
+    d["core_siblings_list"] = read_file(os.path.join(topo, "core_siblings_list")) or None
+    return d
+
+def read_cpu_online_present_possible():
+    base = "/sys/devices/system/cpu"
+    return {
+        "present": read_file(os.path.join(base, "present")) or None,
+        "online": read_file(os.path.join(base, "online")) or None,
+        "possible": read_file(os.path.join(base, "possible")) or None,
+        "offline": read_file(os.path.join(base, "offline")) or None,
+    }
+
+def read_cpuset_info():
+    # May be restricted on some devices
+    paths = {
+        "cpuset_root_cpus": "/dev/cpuset/cpus",
+        "cpuset_root_mems": "/dev/cpuset/mems",
+        "cpuset_top_app_cpus": "/dev/cpuset/top-app/cpus",
+        "cpuset_foreground_cpus": "/dev/cpuset/foreground/cpus",
+        "cpuset_background_cpus": "/dev/cpuset/background/cpus",
+        "cpuset_system_background_cpus": "/dev/cpuset/system-background/cpus",
+    }
+    out = {}
+    for k, p in paths.items():
+        v = read_file(p)
+        if v:
+            out[k] = v
+    return out
+
+def get_process_cpu_snapshot():
+    # Might be restricted; try a few commands
+    cmds = [
         "ps -A -o PID,NAME,CPU%,RSS --sort=-CPU% | head -n 15",
         "ps -eo pid,comm,%cpu,rss --sort=-%cpu | head -n 15",
         "top -b -n 1 | head -n 25",
     ]
-    for c in ps_cmds:
+    for c in cmds:
         out = run(c)
         if out:
-            lines.append(f"$ {c}")
-            lines.append(out)
-            break
-    else:
-        lines.append("Could not list processes (ps/top output restricted on this device).")
-
-    lines.append("\nDone.")
-    lines.append("=" * 70)
-    return "\n".join(lines) + "\n"
-
+            return {"cmd": c, "output": out}
+    return {}
 
 def main():
-    print(f"Logging to: {os.path.abspath(LOG_FILE)}")
-    print(f"Interval: {INTERVAL_SECONDS}s  (Stop with Ctrl+C)\n")
+    snapshot = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "kernel_release": platform.release(),
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+        "android_props": get_android_props(),
+        "cpu_online_present_possible": read_cpu_online_present_possible(),
+        "cpuset": read_cpuset_info(),
+    }
 
-    try:
-        while True:
-            report = build_report()
+    raw_cpuinfo = read_file("/proc/cpuinfo")
+    blocks, common = parse_cpuinfo(raw_cpuinfo)
+    snapshot["proc_cpuinfo_common"] = common
+    snapshot["proc_cpuinfo_per_cpu_blocks"] = blocks  # can be long
+    snapshot["proc_cpuinfo_raw"] = raw_cpuinfo  # can be long
 
-            # Print to screen
-            print(report)
+    cpu_base, cpus = cpu_paths()
+    snapshot["sys_cpu_count_detected"] = len(cpus)
+    snapshot["sys_cpus"] = cpus
 
-            # Append to txt file
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(report)
+    per_core = []
+    per_topo = []
+    for cpu in cpus:
+        per_core.append(read_cpufreq(cpu_base, cpu))
+        per_topo.append(read_topology(cpu_base, cpu))
+    snapshot["cpufreq_per_core"] = per_core
+    snapshot["topology_per_core"] = per_topo
 
-            time.sleep(INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        print("\nStopped. Log saved to:", os.path.abspath(LOG_FILE))
+    # Optional: load avg (helps interpret CPU behavior)
+    snapshot["proc_loadavg"] = read_file("/proc/loadavg") or None
 
+    # Optional: top CPU processes
+    snapshot["top_processes"] = get_process_cpu_snapshot()
+
+    # ---------- Pretty Print ----------
+    print("=" * 70)
+    print("TERMUX CPU SNAPSHOT")
+    print("Time:", snapshot["time"])
+    print("=" * 70)
+
+    print("\n[ANDROID / DEVICE]")
+    for k, v in snapshot["android_props"].items():
+        print(f"{k}: {v}")
+
+    print("\n[CPU PRESENCE]")
+    for k, v in snapshot["cpu_online_present_possible"].items():
+        if v:
+            print(f"{k}: {v}")
+
+    print("\n[/proc/cpuinfo SUMMARY]")
+    for k, v in snapshot["proc_cpuinfo_common"].items():
+        print(f"{k}: {v}")
+
+    print("\n[CPUFREQ PER CORE] (what Android allows)")
+    for d in snapshot["cpufreq_per_core"]:
+        cpu = d["cpu"]
+        if not d.get("cpufreq_available"):
+            print(f"{cpu}: cpufreq not available")
+            continue
+        cur = d.get("scaling_cur_freq_mhz")
+        mi = d.get("scaling_min_freq_mhz")
+        ma = d.get("scaling_max_freq_mhz")
+        gov = d.get("scaling_governor")
+        print(f"{cpu}: cur={cur}MHz min={mi}MHz max={ma}MHz gov={gov}")
+
+    print("\n[TOPOLOGY PER CORE] (if exposed)")
+    any_topo = False
+    for t in snapshot["topology_per_core"]:
+        if t.get("topology_available") and (t.get("core_id") is not None or t.get("physical_package_id") is not None):
+            any_topo = True
+            print(f"{t['cpu']}: package={t.get('physical_package_id')} core={t.get('core_id')} thread_siblings={t.get('thread_siblings_list')}")
+    if not any_topo:
+        print("Topology not exposed (common on locked-down devices).")
+
+    if snapshot.get("cpuset"):
+        print("\n[CPUSET / SCHEDULER HINTS] (app foreground vs background cores)")
+        for k, v in snapshot["cpuset"].items():
+            print(f"{k}: {v}")
+
+    if snapshot.get("proc_loadavg"):
+        print("\n[LOADAVG]")
+        print(snapshot["proc_loadavg"])
+
+    if snapshot.get("top_processes"):
+        print("\n[TOP PROCESSES]")
+        print(f"$ {snapshot['top_processes'].get('cmd')}")
+        print(snapshot["top_processes"].get("output"))
+
+    print("\n[JSON DUMP] (copy/paste this if you want)")
+    print(json.dumps(snapshot, indent=2))
 
 if __name__ == "__main__":
     main()
