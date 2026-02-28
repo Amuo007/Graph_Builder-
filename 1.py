@@ -1,65 +1,88 @@
 #!/usr/bin/env python3
-import os, subprocess, time
-from datetime import datetime
+import time
+import os
 
-INTERVAL = 3   # safer than 2 on Android
-
-def run(cmd):
+def read_file(path, default="N/A"):
     try:
-        return subprocess.check_output(cmd, shell=True, text=True, timeout=1)
+        with open(path) as f:
+            return f.read().strip()
     except:
-        return ""
+        return default
 
-def cpu_freqs():
-    freqs = []
-    base = "/sys/devices/system/cpu"
+def get_ram():
     try:
-        for c in os.listdir(base):
-            if c.startswith("cpu") and c[3:].isdigit():
-                f = run(f"cat {base}/{c}/cpufreq/scaling_cur_freq")
-                if f.strip().isdigit():
-                    freqs.append(int(f)//1000)
+        with open("/proc/meminfo") as f:
+            lines = {l.split(":")[0]: int(l.split()[1]) for l in f if ":" in l}
+        total = lines.get("MemTotal", 0)
+        available = lines.get("MemAvailable", 0)
+        used = total - available
+        return used // 1024, total // 1024  # MB
     except:
-        pass
-    return freqs
+        return 0, 0
 
-def services():
-    out = run("ps -eo comm,%cpu --sort=-%cpu")
-    data = {"kolibri":0,"nginx":0,"mariadbd":0}
-    for line in out.splitlines():
-        for k in data:
-            if k in line:
-                try:
-                    data[k] = float(line.split()[-1])
-                except:
-                    pass
-    return data
+def get_cpu():
+    try:
+        def read_stat():
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            idle = int(parts[4])
+            total = sum(int(x) for x in parts[1:])
+            return idle, total
 
-def mem():
-    total = avail = 0
-    with open("/proc/meminfo") as f:
-        for line in f:
-            if "MemTotal" in line:
-                total = int(line.split()[1])//1024
-            if "MemAvailable" in line:
-                avail = int(line.split()[1])//1024
-    return total, avail
+        idle1, total1 = read_stat()
+        time.sleep(0.5)
+        idle2, total2 = read_stat()
+        usage = 100 * (1 - (idle2 - idle1) / (total2 - total1))
+        return round(usage, 1)
+    except:
+        return "N/A"
 
-print("Monitoring IIAB (Ctrl+C to stop)\n")
+def get_battery():
+    # Common sysfs paths — may vary by device
+    bases = [
+        "/sys/class/power_supply/battery",
+        "/sys/class/power_supply/BAT0",
+        "/sys/class/power_supply/BAT1",
+    ]
+    
+    base = next((b for b in bases if os.path.exists(b)), None)
+    if not base:
+        return {"voltage": "N/A", "temp": "N/A", "status": "N/A", "capacity": "N/A"}
 
-try:
-    while True:
-        t = datetime.now().strftime("%H:%M:%S")
-        total, avail = mem()
+    voltage_raw = read_file(f"{base}/voltage_now")
+    temp_raw    = read_file(f"{base}/temp")
+    status      = read_file(f"{base}/status")
+    capacity    = read_file(f"{base}/capacity")
 
-        print("------------------------------------------------")
-        print("Time:", t)
-        print("CPU MHz:", cpu_freqs())
-        print("Services:", services())
-        print(f"Memory: {avail}MB free / {total}MB total")
-        print("------------------------------------------------\n")
+    voltage = f"{int(voltage_raw) / 1_000_000:.3f}V" if voltage_raw.isdigit() else "N/A"
+    temp    = f"{int(temp_raw) / 10:.1f}°C"           if temp_raw.isdigit()    else "N/A"
 
-        time.sleep(INTERVAL)
+    return {"voltage": voltage, "temp": temp, "status": status, "capacity": capacity}
 
-except KeyboardInterrupt:
-    print("\nStopped.")
+prev_ram_used = None
+
+print("=== IIAB Android Monitor (Ctrl+C to stop) ===\n")
+
+while True:
+    ram_used, ram_total = get_ram()
+    cpu = get_cpu()
+    bat = get_battery()
+
+    # Track RAM delta
+    ram_delta = ""
+    if prev_ram_used is not None:
+        diff = ram_used - prev_ram_used
+        ram_delta = f"  ({'+' if diff >= 0 else ''}{diff} MB)"
+    prev_ram_used = ram_used
+
+    # Battery trend
+    status_icon = {"Charging": "⬆", "Discharging": "⬇", "Full": "✓"}.get(bat["status"], "?")
+
+    print(f"[{time.strftime('%H:%M:%S')}]")
+    print(f"  RAM  : {ram_used} / {ram_total} MB{ram_delta}")
+    print(f"  CPU  : {cpu}%")
+    print(f"  Bat  : {bat['capacity']}% | {bat['voltage']} {status_icon} {bat['status']}")
+    print(f"  Temp : {bat['temp']}")
+    print("-" * 35)
+
+    time.sleep(3)
