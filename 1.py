@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-import time, psutil, subprocess, datetime
+import time, subprocess, datetime, json
 
 LOG_FILE = "baseline_metrics.txt"
 
+def sh(cmd: str) -> str:
+    return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+
+def get_cpu_percent():
+    # Try to extract overall CPU usage from top output
+    out = sh("top -b -n 1 | head -n 5")
+    # Common formats vary; just return the header block so you always log something useful
+    return out
+
+def get_mem_info():
+    # Works reliably on Termux
+    return sh("free -h")
+
 def get_battery():
     try:
-        out = subprocess.check_output(["termux-battery-status"]).decode()
-        return out.strip()
+        return sh("termux-battery-status")
     except:
-        return "Battery info not available"
+        return "Battery info not available (install termux-api + Termux:API app)"
 
 def get_thermal():
-    temps = []
     try:
-        out = subprocess.check_output(
-            "cat /sys/class/thermal/thermal_zone*/temp",
-            shell=True
-        ).decode().splitlines()
-        temps = [str(int(x)/1000) + "°C" for x in out]
+        # millidegree C -> C
+        temps = sh("cat /sys/class/thermal/thermal_zone*/temp").splitlines()
+        temps_c = [f"{int(t)/1000:.1f}C" for t in temps if t.isdigit()]
+        return temps_c if temps_c else temps
     except:
-        temps = ["Thermal not available"]
-    return temps
+        return ["Thermal not available"]
 
 with open(LOG_FILE, "a") as f:
     f.write("\n===== Monitoring Started =====\n")
@@ -28,35 +37,27 @@ with open(LOG_FILE, "a") as f:
 while True:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # CPU + RAM
-    cpu = psutil.cpu_percent(interval=1)
-    mem = psutil.virtual_memory()
-
-    # Battery + voltage
+    cpu_block = get_cpu_percent()
+    mem_block = get_mem_info()
     battery = get_battery()
-
-    # Thermal sensors
     temps = get_thermal()
 
     log = f"""
 Time: {now}
 
-[CPU]
-Usage: {cpu} %
+[CPU(top)]
+{cpu_block}
 
-[RAM]
-Used: {mem.used/1e9:.2f} GB
-Available: {mem.available/1e9:.2f} GB
-Percent: {mem.percent} %
+[RAM(free)]
+{mem_block}
 
 [Battery]
 {battery}
 
 [Thermal]
-Sensors: {temps}
+{temps}
 ----------------------------------------
 """
-
     print(log)
     with open(LOG_FILE, "a") as f:
         f.write(log)
