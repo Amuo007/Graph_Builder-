@@ -1,93 +1,62 @@
 #!/usr/bin/env python3
-import os
-import subprocess
+import os, subprocess, json, time
 from datetime import datetime
 
-def run(cmd: str) -> str:
+INTERVAL = 2
+LOG_FILE = "iiab_perf.jsonl"
+
+def run(cmd):
     try:
-        p = subprocess.run(cmd, shell=True, text=True, capture_output=True)
-        return ((p.stdout or "") + (p.stderr or "")).strip()
-    except Exception:
+        return subprocess.check_output(cmd, shell=True, text=True)
+    except:
         return ""
 
-def read_file(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-def listdir_safe(path: str):
-    try:
-        return sorted(os.listdir(path))
-    except Exception:
-        return []
-
-def int_or_none(s: str):
-    s = (s or "").strip()
-    if s.isdigit():
-        return int(s)
-    try:
-        return int(float(s))
-    except Exception:
-        return None
-
-def khz_to_mhz(khz: int) -> float:
-    return khz / 1000.0
-
-def cpu_list():
+def cpu_freqs():
+    freqs = []
     base = "/sys/devices/system/cpu"
-    cpus = []
-    for name in listdir_safe(base):
-        if name.startswith("cpu") and name[3:].isdigit():
-            cpus.append(name)
-    return base, cpus
+    for c in sorted(os.listdir(base)):
+        if c.startswith("cpu") and c[3:].isdigit():
+            f = run(f"cat {base}/{c}/cpufreq/scaling_cur_freq")
+            if f.strip().isdigit():
+                freqs.append(int(f.strip()) // 1000)
+    return freqs
 
-def read_cpufreq(cpu_base: str, cpu: str):
-    cpufreq = os.path.join(cpu_base, cpu, "cpufreq")
-    cur = int_or_none(read_file(os.path.join(cpufreq, "scaling_cur_freq")))
-    mi  = int_or_none(read_file(os.path.join(cpufreq, "scaling_min_freq")))
-    ma  = int_or_none(read_file(os.path.join(cpufreq, "scaling_max_freq")))
-    return cur, mi, ma
+def top_services():
+    out = run("ps -eo comm,%cpu --sort=-%cpu")
+    data = {"kolibri":0,"nginx":0,"mariadbd":0}
+    for line in out.splitlines():
+        for k in data:
+            if k in line:
+                try:
+                    data[k] = float(line.split()[-1])
+                except:
+                    pass
+    return data
 
-def top_processes():
-    cmds = [
-        "ps -eo pid,comm,%cpu,rss --sort=-%cpu | head -n 15",
-        "ps -A -o PID,NAME,CPU%,RSS --sort=-CPU% | head -n 15",
-        "top -b -n 1 | head -n 25",
-    ]
-    for c in cmds:
-        out = run(c)
-        if out:
-            return c, out
-    return "", "(no ps/top output available)"
+def mem():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith(("MemTotal","MemAvailable")):
+                k,v = line.split(":")
+                m[k] = int(v.split()[0])
+    return m
 
-def main():
-    print("=" * 60)
-    print("IIAB PERF SNAPSHOT (CPU FREQ + TOP PROCESSES)")
-    print("Time:", datetime.now().isoformat(timespec="seconds"))
-    print("=" * 60)
+print("Logging to", LOG_FILE, "every", INTERVAL, "seconds")
 
-    # 1) CPU frequencies
-    print("\n[CPUFREQ PER CORE]")
-    cpu_base, cpus = cpu_list()
-    if not cpus:
-        print("(no cpu entries found)")
-    else:
-        for cpu in cpus:
-            cur, mi, ma = read_cpufreq(cpu_base, cpu)
-            if cur is None and mi is None and ma is None:
-                print(f"{cpu}: (cpufreq not readable)")
-                continue
-            def fmt(x): return f"{khz_to_mhz(x):.0f}MHz" if x is not None else "?"
-            print(f"{cpu}: cur={fmt(cur)} min={fmt(mi)} max={fmt(ma)}")
+try:
+    while True:
+        rec = {
+            "time": datetime.now().isoformat(),
+            "cpu_freq_mhz": cpu_freqs(),
+            "services": top_services(),
+            "mem_kb": mem()
+        }
 
-    # 2) Top processes
-    print("\n[TOP PROCESSES]")
-    cmd, out = top_processes()
-    if cmd:
-        print(f"$ {cmd}")
-    print(out)
+        with open(LOG_FILE,"a") as f:
+            f.write(json.dumps(rec)+"\n")
 
-if __name__ == "__main__":
-    main()
+        time.sleep(INTERVAL)
+
+except KeyboardInterrupt:
+    print("Stopped.")
