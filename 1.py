@@ -1,79 +1,65 @@
 #!/usr/bin/env python3
-import os, subprocess, json, time
+import os, subprocess, time
 from datetime import datetime
 
-INTERVAL = 8          # slower → less stress
-LOG_FILE = "iiab_perf.jsonl"
+INTERVAL = 3   # safer than 2 on Android
 
 def run(cmd):
     try:
-        return subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=1
-        ).stdout
+        return subprocess.check_output(cmd, shell=True, text=True, timeout=1)
     except:
         return ""
 
-# safer CPU freq (no cat spam)
 def cpu_freqs():
     freqs = []
     base = "/sys/devices/system/cpu"
     try:
         for c in os.listdir(base):
             if c.startswith("cpu") and c[3:].isdigit():
-                path = f"{base}/{c}/cpufreq/scaling_cur_freq"
-                if os.path.exists(path):
-                    with open(path) as f:
-                        v = f.read().strip()
-                        if v.isdigit():
-                            freqs.append(int(v)//1000)
+                f = run(f"cat {base}/{c}/cpufreq/scaling_cur_freq")
+                if f.strip().isdigit():
+                    freqs.append(int(f)//1000)
     except:
         pass
     return freqs
 
-# lighter top services (single scan)
-def top_services():
+def services():
+    out = run("ps -eo comm,%cpu --sort=-%cpu")
     data = {"kolibri":0,"nginx":0,"mariadbd":0}
-    try:
-        out = subprocess.run(
-            ["ps","-eo","comm,%cpu"],
-            capture_output=True, text=True, timeout=1
-        ).stdout
-
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 2:
-                name, cpu = parts
-                if name in data:
-                    data[name] = float(cpu)
-    except:
-        pass
+    for line in out.splitlines():
+        for k in data:
+            if k in line:
+                try:
+                    data[k] = float(line.split()[-1])
+                except:
+                    pass
     return data
 
 def mem():
-    m = {}
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith(("MemTotal","MemAvailable")):
-                    k,v = line.split(":")
-                    m[k] = int(v.split()[0])
-    except:
-        pass
-    return m
+    total = avail = 0
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if "MemTotal" in line:
+                total = int(line.split()[1])//1024
+            if "MemAvailable" in line:
+                avail = int(line.split()[1])//1024
+    return total, avail
 
-print("Logging every", INTERVAL, "sec →", LOG_FILE)
+print("Monitoring IIAB (Ctrl+C to stop)\n")
 
 try:
-    with open(LOG_FILE, "a", buffering=1) as f:   # line buffered
-        while True:
-            rec = {
-                "time": datetime.now().isoformat(),
-                "cpu_freq_mhz": cpu_freqs(),
-                "services": top_services(),
-                "mem_kb": mem()
-            }
-            f.write(json.dumps(rec) + "\n")
-            time.sleep(INTERVAL)
+    while True:
+        t = datetime.now().strftime("%H:%M:%S")
+        total, avail = mem()
+
+        print("------------------------------------------------")
+        print("Time:", t)
+        print("CPU MHz:", cpu_freqs())
+        print("Services:", services())
+        print(f"Memory: {avail}MB free / {total}MB total")
+        print("------------------------------------------------\n")
+
+        time.sleep(INTERVAL)
 
 except KeyboardInterrupt:
-    print("Stopped.")
+    print("\nStopped.")
